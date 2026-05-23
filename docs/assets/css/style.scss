@@ -1,0 +1,116 @@
+---
+---
+@import "{{ site.theme }}";
+
+/* Custom modern aesthetics to guarantee it looks completely different from cpp-tui */
+$header-bg-color: #0f172a; /* Deep slate */
+$header-bg-color-secondary: #8b5cf6; /* Vibrant violet */
+
+.page-header {
+  background-color: $header-bg-color;
+  background-image: linear-gradient(135deg, $header-bg-color, $header-bg-color-secondary);
+  color: #ffffff;
+  padding: 5rem 2rem;
+  text-align: center;
+  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+  border-bottom: 4px solid #c4b5fd;
+}
+
+.project-name {
+  font-size: 3.5rem;
+  font-weight: 800;
+  letter-spacing: -0.05em;
+  text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+  color: #ffffff;
+  border-bottom: none;
+}
+
+.project-name a {
+  color: #ffffff !important;
+  text-decoration: none !important;
+}
+
+.project-name a:hover {
+  text-decoration: underline !important;
+}
+
+.project-tagline {
+  font-size: 1.25rem;
+  opacity: 0.9;
+  font-weight: 300;
+  color: #ffffff;
+  border-bottom: none;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  background-color: #f8fafc;
+  color: #334155;
+  line-height: 1.7;
+}
+
+.main-content {
+  max-width: 800px;
+  background: #ffffff;
+  padding: 3rem;
+  margin-top: -3rem;
+  border-radius: 12px;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+}
+
+h1, h2, h3, h4 {
+  color: #0f172a;
+  font-weight: 700;
+  margin-top: 2rem;
+  border-bottom: 2px solid #e2e8f0;
+  padding-bottom: 0.5rem;
+}
+
+a {
+  color: #6d28d9;
+  text-decoration: none;
+  font-weight: 500;
+  transition: all 0.2s ease;
+}
+
+a:hover {
+  color: #4c1d95;
+  text-decoration: underline;
+}
+
+code {
+  background: #f1f5f9;
+  color: #c026d3;
+  padding: 0.2rem 0.4rem;
+  border-radius: 4px;
+  font-size: 0.9em;
+}
+
+pre {
+  background: #1e293b;
+  border-radius: 8px;
+  padding: 1.5rem;
+  overflow-x: auto;
+  box-shadow: inset 0 2px 4px 0 rgba(0,0,0,0.06);
+}
+
+pre code {
+  background: transparent;
+  color: #e2e8f0;
+  padding: 0;
+}
+
+.btn {
+  background: #8b5cf6;
+  color: white;
+  border: none;
+  border-radius: 999px;
+  padding: 0.75rem 1.5rem;
+  font-weight: 600;
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(139, 92, 246, 0.4);
+}
