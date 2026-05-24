@@ -30,8 +30,8 @@ namespace cpppubsub
 {
 
     constexpr int VERSION_MAJOR = 1;
-    constexpr int VERSION_MINOR = 1;
-    constexpr int VERSION_PATCH = 2;
+    constexpr int VERSION_MINOR = 2;
+    constexpr int VERSION_PATCH = 0;
 
     /**
      * @brief Returns the library version as a string.
@@ -86,8 +86,8 @@ namespace cpppubsub
             : max_capacity_(max_capacity), overflow_policy_(policy)
         {
 #ifdef _WIN32
-            // Auto-reset event
-            event_ = CreateEvent(NULL, FALSE, FALSE, NULL);
+            // Manual-reset event
+            event_ = CreateEvent(NULL, TRUE, FALSE, NULL);
             if (!event_)
                 throw std::runtime_error("Failed to create Windows Event");
 #else
@@ -131,6 +131,7 @@ namespace cpppubsub
          */
         void push(const T &message)
         {
+            bool needs_signal = false;
             {
                 std::unique_lock<std::mutex> lock(mtx_);
 
@@ -155,16 +156,20 @@ namespace cpppubsub
                         return;
                     }
                 }
+                needs_signal = queue_.empty();
                 queue_.push_back(message);
             }
 
             // Signal OS event (outside of mutex lock)
+            if (needs_signal)
+            {
 #ifdef _WIN32
-            SetEvent(event_);
+                SetEvent(event_);
 #else
-            char c = 1;
-            [[maybe_unused]] auto res = write(pipe_fds_[1], &c, 1);
+                char c = 1;
+                [[maybe_unused]] auto res = write(pipe_fds_[1], &c, 1);
 #endif
+            }
         }
 
         /**
@@ -180,7 +185,9 @@ namespace cpppubsub
                 std::lock_guard<std::mutex> lock(mtx_);
                 if (queue_.empty())
                 {
-#ifndef _WIN32
+#ifdef _WIN32
+                    ResetEvent(event_);
+#else
                     // Clear the pipe so poll stops triggering
                     char c;
                     while (read(pipe_fds_[0], &c, 1) > 0)
@@ -194,27 +201,18 @@ namespace cpppubsub
                 queue_.pop_front();
                 popped = true;
 
-#ifdef _WIN32
-                if (!queue_.empty())
-                {
-                    SetEvent(event_);
-                }
-#else
                 if (queue_.empty())
                 {
+#ifdef _WIN32
+                    ResetEvent(event_);
+#else
                     // Clear the pipe
                     char c;
                     while (read(pipe_fds_[0], &c, 1) > 0)
                     {
                     }
-                }
-                else
-                {
-                    // Ensure poll will trigger for remaining items
-                    char c = 1;
-                    [[maybe_unused]] auto res = write(pipe_fds_[1], &c, 1);
-                }
 #endif
+                }
             }
 
             // Notify sleeping publishers (if any) that space is available
@@ -415,10 +413,18 @@ namespace cpppubsub
 #else
             int fd;
 #endif
-            std::function<void()> process_all;
+            std::function<bool()> process_all;
+            bool dead = false;
         };
 
+        std::mutex mtx_;
         std::vector<WaitTarget> targets_;
+        bool dirty_ = false;
+#ifdef _WIN32
+        std::vector<HANDLE> cached_handles_;
+#else
+        std::vector<struct pollfd> cached_fds_;
+#endif
 
     public:
         /**
@@ -436,14 +442,27 @@ namespace cpppubsub
 #else
             target.fd = sub->GetWaitFD();
 #endif
-            target.process_all = [sub, callback]()
+            std::weak_ptr<Subscriber<T>> weak_sub = sub;
+            target.process_all = [weak_sub, callback]() -> bool
             {
-                while (auto msg = sub->try_receive())
+                auto locked_sub = weak_sub.lock();
+                if (!locked_sub)
+                    return false; // Subscriber is dead
+
+                int max_process = 100; // Limit processing to prevent starvation
+                while (max_process-- > 0)
                 {
+                    auto msg = locked_sub->try_receive();
+                    if (!msg)
+                        break;
                     callback(*msg);
                 }
+                return true; // Still alive
             };
+
+            std::lock_guard<std::mutex> lock(mtx_);
             targets_.push_back(std::move(target));
+            dirty_ = true;
         }
 
         /**
@@ -456,38 +475,111 @@ namespace cpppubsub
         template <typename Rep, typename Period>
         bool WaitFor(const std::chrono::duration<Rep, Period> &timeout)
         {
+            std::lock_guard<std::mutex> lock(mtx_);
+
+            if (dirty_)
+            {
+                auto it = targets_.begin();
+                while (it != targets_.end())
+                {
+                    if (it->dead)
+                        it = targets_.erase(it);
+                    else
+                        ++it;
+                }
+
+#ifdef _WIN32
+                cached_handles_.clear();
+                for (const auto &t : targets_)
+                    cached_handles_.push_back(t.handle);
+#else
+                cached_fds_.clear();
+                for (const auto &t : targets_)
+                    cached_fds_.push_back({t.fd, POLLIN, 0});
+#endif
+                dirty_ = false;
+            }
+
             if (targets_.empty())
                 return false;
+
             auto timeout_ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count();
 
 #ifdef _WIN32
-            std::vector<HANDLE> handles;
-            for (const auto &t : targets_)
-                handles.push_back(t.handle);
-
-            DWORD result = WaitForMultipleObjects(
-                static_cast<DWORD>(handles.size()), handles.data(), FALSE, static_cast<DWORD>(timeout_ms));
-
-            if (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + handles.size())
+            if (cached_handles_.size() <= MAXIMUM_WAIT_OBJECTS)
             {
-                targets_[result - WAIT_OBJECT_0].process_all();
-                return true;
-            }
-            return false;
-#else
-            std::vector<struct pollfd> fds;
-            for (const auto &t : targets_)
-                fds.push_back({t.fd, POLLIN, 0});
+                DWORD result = WaitForMultipleObjects(
+                    static_cast<DWORD>(cached_handles_.size()), cached_handles_.data(), FALSE, static_cast<DWORD>(timeout_ms));
 
-            int result = poll(fds.data(), fds.size(), static_cast<int>(timeout_ms));
+                if (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + cached_handles_.size())
+                {
+                    size_t idx = result - WAIT_OBJECT_0;
+                    if (!targets_[idx].process_all())
+                    {
+                        targets_[idx].dead = true;
+                        dirty_ = true;
+                    }
+                    return true;
+                }
+                return false;
+            }
+            else
+            {
+                auto start_time = std::chrono::steady_clock::now();
+                bool any_processed = false;
+
+                while (true)
+                {
+                    bool chunk_signaled = false;
+                    for (size_t i = 0; i < cached_handles_.size(); i += MAXIMUM_WAIT_OBJECTS)
+                    {
+                        DWORD count = static_cast<DWORD>(cached_handles_.size() - i);
+                        if (count > MAXIMUM_WAIT_OBJECTS)
+                            count = MAXIMUM_WAIT_OBJECTS;
+
+                        DWORD result = WaitForMultipleObjects(count, cached_handles_.data() + i, FALSE, 0);
+
+                        if (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + count)
+                        {
+                            size_t idx = i + (result - WAIT_OBJECT_0);
+                            if (!targets_[idx].process_all())
+                            {
+                                targets_[idx].dead = true;
+                                dirty_ = true;
+                            }
+                            chunk_signaled = true;
+                            any_processed = true;
+                        }
+                    }
+
+                    if (chunk_signaled)
+                        return true;
+
+                    auto now = std::chrono::steady_clock::now();
+                    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count() >= timeout_ms)
+                        break;
+                    Sleep(1);
+                }
+                return any_processed;
+            }
+#else
+            int result = poll(cached_fds_.data(), cached_fds_.size(), static_cast<int>(timeout_ms));
             if (result > 0)
             {
-                for (size_t i = 0; i < fds.size(); ++i)
+                bool processed = false;
+                for (size_t i = 0; i < cached_fds_.size(); ++i)
                 {
-                    if (fds[i].revents & POLLIN)
-                        targets_[i].process_all();
+                    if (cached_fds_[i].revents & POLLIN)
+                    {
+                        if (!targets_[i].process_all())
+                        {
+                            targets_[i].dead = true;
+                            dirty_ = true;
+                        }
+                        processed = true;
+                    }
                 }
-                return true;
+                return processed;
             }
             return false;
 #endif
