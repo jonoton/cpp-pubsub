@@ -9,6 +9,24 @@ layout: default
 
 While `try_receive()` is great for manual polling, `cpp-pubsub` provides powerful abstractions for efficient asynchronous multiplexing over multiple topics.
 
+## High-Performance Publishing
+
+By default, calling `broker.Publish("topic", message)` requires a hash map lookup and a mutex lock to find the correct topic inside the broker. For high-frequency publishers, this overhead can become a bottleneck.
+
+To bypass the broker lookup entirely, you can create a dedicated `Publisher` object. This object holds a direct reference to the underlying topic.
+
+```cpp
+// 1. Create a dedicated publisher for a specific topic
+auto publisher = broker.CreatePublisher<std::string>("system_events");
+
+// 2. Publish messages directly (no hash map lookup, no broker lock)
+for (int i = 0; i < 10000; ++i) {
+    publisher.Publish("Fast message " + std::to_string(i));
+}
+```
+
+This approach is highly recommended when you need to publish many messages in a tight loop.
+
 ## Background Worker
 
 For asynchronous background processing, you can use the `Worker` class. A `Worker` spawns a dedicated background thread that efficiently sleeps and wakes up immediately whenever messages arrive on any of its subscriptions.

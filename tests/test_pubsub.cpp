@@ -296,3 +296,99 @@ TEST(PubSubTest, SharedPtrMessageCleanup) {
     
     EXPECT_TRUE(weak3.expired());
 }
+
+// Test Topic Mutex Block Issue
+TEST(PubSubTest, TopicPublishDoesNotBlockOnFullQueue) {
+    PubSub ps;
+    // Create a subscriber with capacity 1 and Block policy
+    auto sub1 = ps.Subscribe<int>("block_topic", 1, OverflowPolicy::Block);
+    
+    // Fill the queue
+    ps.Publish<int>("block_topic", 1);
+    
+    // Spawn a thread to publish a second message.
+    // This will block because the queue is full.
+    std::atomic<bool> thread_blocked{true};
+    std::thread t([&]() {
+        ps.Publish<int>("block_topic", 2);
+        thread_blocked = false;
+    });
+    
+    // Give the thread a moment to block inside Publish
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    
+    // If the bug is present, the Topic mutex is held by the background thread,
+    // so AddSubscriber (or Subscribe) will hang indefinitely.
+    // We expect this to complete almost instantly now.
+    auto start = std::chrono::steady_clock::now();
+    auto sub2 = ps.Subscribe<int>("block_topic", 10, OverflowPolicy::Block);
+    auto end = std::chrono::steady_clock::now();
+    
+    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    EXPECT_LT(duration_ms, 50); // Should be very fast, well under 50ms
+    
+    // Now pop the first message, which should unblock the thread
+    auto msg1 = sub1->try_receive();
+    EXPECT_TRUE(msg1.has_value());
+    EXPECT_EQ(msg1.value(), 1);
+    
+    t.join();
+    EXPECT_FALSE(thread_blocked.load());
+    
+    auto msg2 = sub1->try_receive();
+    EXPECT_TRUE(msg2.has_value());
+    EXPECT_EQ(msg2.value(), 2);
+}
+
+// Test Publisher class
+TEST(PubSubTest, PublisherClass) {
+    PubSub ps;
+    auto sub = ps.Subscribe<int>("pub_class_topic");
+    
+    auto publisher = ps.CreatePublisher<int>("pub_class_topic");
+    publisher.Publish(42);
+    publisher.Publish(100);
+    
+    auto msg1 = sub->try_receive();
+    auto msg2 = sub->try_receive();
+    auto msg3 = sub->try_receive();
+    
+    ASSERT_TRUE(msg1.has_value());
+    EXPECT_EQ(msg1.value(), 42);
+    ASSERT_TRUE(msg2.has_value());
+    EXPECT_EQ(msg2.value(), 100);
+    EXPECT_FALSE(msg3.has_value());
+}
+
+// Test Publisher Thread Safety
+TEST(PubSubTest, PublisherThreadSafety) {
+    PubSub ps;
+    auto sub = ps.Subscribe<int>("pub_thread_topic", 10000);
+    auto publisher = ps.CreatePublisher<int>("pub_thread_topic");
+    
+    const int NUM_THREADS = 10;
+    const int MESSAGES_PER_THREAD = 100;
+    
+    std::vector<std::thread> threads;
+    for (int i = 0; i < NUM_THREADS; ++i) {
+        // Pass publisher by value to test copy semantics implicitly
+        threads.emplace_back([publisher, MESSAGES_PER_THREAD]() mutable {
+            for (int j = 0; j < MESSAGES_PER_THREAD; ++j) {
+                publisher.Publish(1);
+            }
+        });
+    }
+    
+    for (auto& t : threads) {
+        t.join();
+    }
+    
+    int count = 0;
+    while (auto msg = sub->try_receive()) {
+        count += msg.value();
+    }
+    
+    EXPECT_EQ(count, NUM_THREADS * MESSAGES_PER_THREAD);
+}
+
+

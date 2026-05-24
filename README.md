@@ -7,6 +7,7 @@
 - **Thread-Safe by Design:** Uses standard C++ primitives (`<mutex>`, `<condition_variable>`) to guarantee safe multi-threaded dispatching. Multiple publishers and subscribers can operate simultaneously without data races.
 - **Robust Memory Management:** Deep integration with C++ smart pointers guarantees memory safety. The broker safely manages `Subscriber` lifecycles (no manual unsubscribe needed) and strictly respects `std::shared_ptr` reference counts to prevent memory leaks even when unread messages are dropped from full queues.
 - **Background Workers:** Includes a robust `Worker` and `Selector` system for asynchronous background processing of multiple topics simultaneously.
+- **High-Performance Publishers:** Create dedicated `Publisher` objects that bypass internal map lookups and locks for maximum throughput.
 - **Type-Safe Topics:** Topics and subscribers strictly enforce the type of the messages being passed.
 
 ## Integration

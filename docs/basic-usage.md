@@ -37,6 +37,8 @@ int main() {
 }
 ```
 
+> **Note:** For high-frequency publishing scenarios, see [Advanced Usage: High-Performance Publishing](./advanced-usage.html#high-performance-publishing) to learn how to bypass internal broker lookups.
+
 ## Queue Capacities & Overflow Policies
 
 **Memory Safety Built-In:** The library correctly handles C++ smart pointers (like `std::shared_ptr`). When messages are discarded due to overflow policies or when a subscriber is destroyed, the library automatically cleans up the dropped data, fully respecting reference counts and preventing memory leaks.
