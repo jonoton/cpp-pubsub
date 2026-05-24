@@ -31,7 +31,7 @@ namespace cpppubsub
 
     constexpr int VERSION_MAJOR = 1;
     constexpr int VERSION_MINOR = 1;
-    constexpr int VERSION_PATCH = 0;
+    constexpr int VERSION_PATCH = 1;
 
     /**
      * @brief Returns the library version as a string.

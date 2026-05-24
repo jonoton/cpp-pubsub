@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(cpppubsub VERSION 1.0.0 LANGUAGES CXX)
+project(cpppubsub LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,6 +9,7 @@ add_library(cpppubsub INTERFACE)
 add_library(cpppubsub::cpppubsub ALIAS cpppubsub)
 
 target_include_directories(cpppubsub INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(cpppubsub INTERFACE cxx_std_17)
 
 find_package(Threads REQUIRED)
 target_link_libraries(cpppubsub INTERFACE Threads::Threads)
