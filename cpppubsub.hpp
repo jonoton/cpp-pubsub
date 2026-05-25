@@ -30,7 +30,7 @@ namespace cpppubsub
 {
 
     constexpr int VERSION_MAJOR = 1;
-    constexpr int VERSION_MINOR = 2;
+    constexpr int VERSION_MINOR = 3;
     constexpr int VERSION_PATCH = 0;
 
     /**
@@ -43,6 +43,19 @@ namespace cpppubsub
                std::to_string(VERSION_MINOR) + "." +
                std::to_string(VERSION_PATCH);
     }
+
+#ifdef _WIN32
+    namespace detail
+    {
+        inline VOID CALLBACK SelectorWaitCallback(PVOID lpParam, BOOLEAN TimerOrWaitFired)
+        {
+            if (!TimerOrWaitFired)
+            {
+                SetEvent(static_cast<HANDLE>(lpParam));
+            }
+        }
+    }
+#endif
 
     /**
      * @brief Defines the policy for handling a full subscriber queue.
@@ -402,6 +415,11 @@ namespace cpppubsub
 
     /**
      * @brief Multiplexer for polling multiple subscribers efficiently.
+     *
+     * @note On Windows, waiting on more than 64 subscribers simultaneously will
+     * trigger a fallback to the Windows Thread Pool API, which carries higher
+     * latency and overhead. For optimal performance, distribute subscriptions
+     * across multiple Selector or Worker instances (keeping each <= 64).
      */
     class Selector
     {
@@ -418,7 +436,7 @@ namespace cpppubsub
         };
 
         std::mutex mtx_;
-        std::vector<WaitTarget> targets_;
+        std::vector<std::shared_ptr<WaitTarget>> targets_;
         bool dirty_ = false;
 #ifdef _WIN32
         std::vector<HANDLE> cached_handles_;
@@ -436,14 +454,14 @@ namespace cpppubsub
         template <typename T>
         void Add(std::shared_ptr<Subscriber<T>> sub, std::function<void(const T &)> callback)
         {
-            WaitTarget target;
+            auto target = std::make_shared<WaitTarget>();
 #ifdef _WIN32
-            target.handle = sub->GetWaitHandle();
+            target->handle = sub->GetWaitHandle();
 #else
-            target.fd = sub->GetWaitFD();
+            target->fd = sub->GetWaitFD();
 #endif
             std::weak_ptr<Subscriber<T>> weak_sub = sub;
-            target.process_all = [weak_sub, callback]() -> bool
+            target->process_all = [weak_sub, callback]() -> bool
             {
                 auto locked_sub = weak_sub.lock();
                 if (!locked_sub)
@@ -475,48 +493,65 @@ namespace cpppubsub
         template <typename Rep, typename Period>
         bool WaitFor(const std::chrono::duration<Rep, Period> &timeout)
         {
-            std::lock_guard<std::mutex> lock(mtx_);
+            std::vector<std::shared_ptr<WaitTarget>> local_targets;
+#ifdef _WIN32
+            std::vector<HANDLE> handles;
+#else
+            std::vector<struct pollfd> fds;
+#endif
 
-            if (dirty_)
             {
-                auto it = targets_.begin();
-                while (it != targets_.end())
+                std::unique_lock<std::mutex> lock(mtx_);
+
+                if (dirty_)
                 {
-                    if (it->dead)
-                        it = targets_.erase(it);
-                    else
-                        ++it;
-                }
+                    auto it = targets_.begin();
+                    while (it != targets_.end())
+                    {
+                        if ((*it)->dead)
+                            it = targets_.erase(it);
+                        else
+                            ++it;
+                    }
 
 #ifdef _WIN32
-                cached_handles_.clear();
-                for (const auto &t : targets_)
-                    cached_handles_.push_back(t.handle);
+                    cached_handles_.clear();
+                    for (const auto &t : targets_)
+                        cached_handles_.push_back(t->handle);
 #else
-                cached_fds_.clear();
-                for (const auto &t : targets_)
-                    cached_fds_.push_back({t.fd, POLLIN, 0});
+                    cached_fds_.clear();
+                    for (const auto &t : targets_)
+                        cached_fds_.push_back({t->fd, POLLIN, 0});
 #endif
-                dirty_ = false;
-            }
+                    dirty_ = false;
+                }
 
-            if (targets_.empty())
-                return false;
+                if (targets_.empty())
+                    return false;
+
+                local_targets = targets_;
+#ifdef _WIN32
+                handles = cached_handles_;
+#else
+                fds = cached_fds_;
+#endif
+            }
 
             auto timeout_ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count();
 
 #ifdef _WIN32
-            if (cached_handles_.size() <= MAXIMUM_WAIT_OBJECTS)
+            if (handles.size() <= MAXIMUM_WAIT_OBJECTS)
             {
                 DWORD result = WaitForMultipleObjects(
-                    static_cast<DWORD>(cached_handles_.size()), cached_handles_.data(), FALSE, static_cast<DWORD>(timeout_ms));
+                    static_cast<DWORD>(handles.size()), handles.data(), FALSE, static_cast<DWORD>(timeout_ms));
 
-                if (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + cached_handles_.size())
+                if (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + handles.size())
                 {
                     size_t idx = result - WAIT_OBJECT_0;
-                    if (!targets_[idx].process_all())
+                    if (!local_targets[idx]->process_all())
                     {
-                        targets_[idx].dead = true;
+                        local_targets[idx]->dead = true;
+                        std::lock_guard<std::mutex> lock(mtx_);
                         dirty_ = true;
                     }
                     return true;
@@ -525,55 +560,59 @@ namespace cpppubsub
             }
             else
             {
-                auto start_time = std::chrono::steady_clock::now();
-                bool any_processed = false;
+                // [NOTE] Windows > 64 Handles Fallback:
+                // When waiting on more than 64 handles, we fallback to the Windows Thread Pool API
+                // to avoid busy-waiting. This carries higher latency and overhead. For optimal
+                // performance on Windows, distribute subscriptions across multiple Worker instances
+                // to keep each under the 64-handle limit.
+                HANDLE wakeup_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+                std::vector<HANDLE> wait_handles(handles.size(), NULL);
 
-                while (true)
+                for (size_t i = 0; i < handles.size(); ++i)
                 {
-                    bool chunk_signaled = false;
-                    for (size_t i = 0; i < cached_handles_.size(); i += MAXIMUM_WAIT_OBJECTS)
+                    RegisterWaitForSingleObject(&wait_handles[i], handles[i], &detail::SelectorWaitCallback, wakeup_event, INFINITE, WT_EXECUTEONLYONCE);
+                }
+
+                WaitForSingleObject(wakeup_event, static_cast<DWORD>(timeout_ms));
+
+                for (size_t i = 0; i < wait_handles.size(); ++i)
+                {
+                    if (wait_handles[i])
                     {
-                        DWORD count = static_cast<DWORD>(cached_handles_.size() - i);
-                        if (count > MAXIMUM_WAIT_OBJECTS)
-                            count = MAXIMUM_WAIT_OBJECTS;
-
-                        DWORD result = WaitForMultipleObjects(count, cached_handles_.data() + i, FALSE, 0);
-
-                        if (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + count)
-                        {
-                            size_t idx = i + (result - WAIT_OBJECT_0);
-                            if (!targets_[idx].process_all())
-                            {
-                                targets_[idx].dead = true;
-                                dirty_ = true;
-                            }
-                            chunk_signaled = true;
-                            any_processed = true;
-                        }
+                        UnregisterWaitEx(wait_handles[i], INVALID_HANDLE_VALUE);
                     }
+                }
+                CloseHandle(wakeup_event);
 
-                    if (chunk_signaled)
-                        return true;
-
-                    auto now = std::chrono::steady_clock::now();
-                    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count() >= timeout_ms)
-                        break;
-                    Sleep(1);
+                bool any_processed = false;
+                for (size_t i = 0; i < handles.size(); ++i)
+                {
+                    if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0)
+                    {
+                        if (!local_targets[i]->process_all())
+                        {
+                            local_targets[i]->dead = true;
+                            std::lock_guard<std::mutex> lock(mtx_);
+                            dirty_ = true;
+                        }
+                        any_processed = true;
+                    }
                 }
                 return any_processed;
             }
 #else
-            int result = poll(cached_fds_.data(), cached_fds_.size(), static_cast<int>(timeout_ms));
+            int result = poll(fds.data(), fds.size(), static_cast<int>(timeout_ms));
             if (result > 0)
             {
                 bool processed = false;
-                for (size_t i = 0; i < cached_fds_.size(); ++i)
+                for (size_t i = 0; i < fds.size(); ++i)
                 {
-                    if (cached_fds_[i].revents & POLLIN)
+                    if (fds[i].revents & POLLIN)
                     {
-                        if (!targets_[i].process_all())
+                        if (!local_targets[i]->process_all())
                         {
-                            targets_[i].dead = true;
+                            local_targets[i]->dead = true;
+                            std::lock_guard<std::mutex> lock(mtx_);
                             dirty_ = true;
                         }
                         processed = true;
@@ -588,6 +627,10 @@ namespace cpppubsub
 
     /**
      * @brief A background worker that automatically polls a selector.
+     *
+     * @note On Windows, limiting a Worker to a maximum of 64 subscriptions is
+     * recommended for optimal performance. Exceeding this limit invokes the
+     * Thread Pool API fallback, which may increase processing latency.
      */
     class Worker
     {

@@ -31,6 +31,8 @@ This approach is highly recommended when you need to publish many messages in a 
 
 For asynchronous background processing, you can use the `Worker` class. A `Worker` spawns a dedicated background thread that efficiently sleeps and wakes up immediately whenever messages arrive on any of its subscriptions.
 
+**Note for Windows Users:** For optimal performance, it is highly recommended to limit each `Worker` to a maximum of 64 subscriptions. Exceeding this limit invokes the Windows Thread Pool API fallback, which carries higher latency. If you have hundreds of subscriptions, distribute them across multiple `Worker` instances.
+
 ```cpp
 #include "cpppubsub.hpp"
 #include <iostream>
@@ -73,6 +75,8 @@ int main() {
 If you already have your own event loop or thread and do not want to spawn a new one with `Worker`, you can manually multiplex multiple subscribers natively using the `Selector` class.
 
 The `Selector` is highly optimized: it does not use a spin-lock. Instead, it waits on native OS events until a message arrives.
+
+**Note for Windows Users:** Just like `Worker`, a `Selector` on Windows performs optimally when tracking 64 or fewer subscriptions. Exceeding 64 subscriptions triggers a Thread Pool API fallback to bypass the `WaitForMultipleObjects` limit, which introduces higher overhead.
 
 ```cpp
 std::atomic<bool> keep_running{true};

@@ -12,7 +12,7 @@ layout: default
 ### OS-Level Events for Efficient Multiplexing
 Instead of relying on CPU-heavy spinlocking or basic condition variables for `Selector` multiplexing, `cpp-pubsub` uses highly optimized OS-native handles:
 - **POSIX:** Uses anonymous `pipe` and `poll`.
-- **Windows:** Uses `CreateEvent` and `WaitForMultipleObjects`.
+- **Windows:** Uses `CreateEvent` and `WaitForMultipleObjects`. *(Note: Waiting on more than 64 handles dynamically falls back to the Windows Thread Pool API (`RegisterWaitForSingleObject`) to avoid busy-waiting, though this introduces additional latency. For best performance on Windows, keep the number of subscriptions per `Selector` under 64).*
 
 This allows the `Selector` and `Worker` to sleep natively and wake instantly when a message arrives on *any* monitored topic, ensuring minimal CPU usage while idle.
 
