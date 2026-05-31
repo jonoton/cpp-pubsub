@@ -391,4 +391,240 @@ TEST(PubSubTest, PublisherThreadSafety) {
     EXPECT_EQ(count, NUM_THREADS * MESSAGES_PER_THREAD);
 }
 
+// Test Selector behavior when a registered subscriber is destroyed
+TEST(SelectorTest, SubscriberDestructionNoBusyLoop) {
+    PubSub ps;
+    Selector selector;
+    std::atomic<int> sum{0};
+
+    // Keep one subscriber alive so the selector has at least one active channel to wait on
+    auto sub_alive = ps.Subscribe<int>("alive_topic");
+    selector.Add<int>(sub_alive, [](const int&) {});
+
+    {
+        auto sub = ps.Subscribe<int>("temp_topic");
+        selector.Add<int>(sub, [&sum](const int& val) { sum += val; });
+
+        ps.Publish<int>("temp_topic", 10);
+        // Wait and process
+        bool processed = selector.WaitFor(std::chrono::milliseconds(50));
+        EXPECT_TRUE(processed);
+        EXPECT_EQ(sum.load(), 10);
+    } // sub is destroyed here, closing its event/pipe
+
+    // Call WaitFor. If the busy loop bug exists, this will return immediately due to POLLNVAL/invalid handle.
+    // When fixed, it should clean up the expired subscriber and block for the full timeout on the alive subscriber.
+    auto start = std::chrono::steady_clock::now();
+    bool processed = selector.WaitFor(std::chrono::milliseconds(50));
+    auto end = std::chrono::steady_clock::now();
+
+    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    EXPECT_FALSE(processed);
+    // It should have waited for the full timeout since no events are pending on the alive subscriber
+    EXPECT_GE(duration_ms, 40); 
+}
+
+// Test Zero Capacity throws std::invalid_argument
+TEST(PubSubTest, ZeroCapacityException) {
+    PubSub ps;
+    EXPECT_THROW({
+        ps.Subscribe<int>("zero_capacity", 0);
+    }, std::invalid_argument);
+}
+
+// Test Explicit Unsubscribe
+TEST(PubSubTest, Unsubscribe) {
+    PubSub ps;
+    auto sub1 = ps.Subscribe<int>("unsub_topic");
+    auto sub2 = ps.Subscribe<int>("unsub_topic");
+
+    ps.Publish<int>("unsub_topic", 10);
+    
+    // Both should receive the message
+    auto msg1 = sub1->try_receive();
+    auto msg2 = sub2->try_receive();
+    ASSERT_TRUE(msg1.has_value());
+    ASSERT_TRUE(msg2.has_value());
+    EXPECT_EQ(msg1.value(), 10);
+    EXPECT_EQ(msg2.value(), 10);
+
+    // Unsubscribe sub1
+    ps.Unsubscribe<int>("unsub_topic", sub1);
+
+    ps.Publish<int>("unsub_topic", 20);
+
+    // sub1 should not get it, sub2 should
+    auto msg1_after = sub1->try_receive();
+    auto msg2_after = sub2->try_receive();
+    EXPECT_FALSE(msg1_after.has_value());
+    ASSERT_TRUE(msg2_after.has_value());
+    EXPECT_EQ(msg2_after.value(), 20);
+}
+
+// Test explicit topic removal and clear
+TEST(PubSubTest, TopicLifecycle) {
+    PubSub ps;
+    auto sub = ps.Subscribe<int>("lifecycle_topic");
+    ps.Publish<int>("lifecycle_topic", 100);
+
+    // Remove topic
+    ps.RemoveTopic("lifecycle_topic");
+
+    // Publishing to "lifecycle_topic" now will create a NEW topic, so "sub" won't get it
+    ps.Publish<int>("lifecycle_topic", 200);
+
+    auto msg1 = sub->try_receive();
+    ASSERT_TRUE(msg1.has_value());
+    EXPECT_EQ(msg1.value(), 100); // from the old topic
+
+    auto msg2 = sub->try_receive();
+    EXPECT_FALSE(msg2.has_value()); // didn't get 200 because topic was recreated
+}
+
+// Test Move-Only type support
+TEST(PubSubTest, MoveOnlyType) {
+    PubSub ps;
+    auto sub = ps.Subscribe<std::unique_ptr<int>>("move_only_topic");
+
+    auto ptr = std::make_unique<int>(1337);
+    ps.Publish("move_only_topic", std::move(ptr));
+
+    auto msg = sub->try_receive();
+    ASSERT_TRUE(msg.has_value());
+    ASSERT_NE(msg.value(), nullptr);
+    EXPECT_EQ(*msg.value(), 1337);
+}
+
+// Test that publishing a move-only type with multiple active subscribers throws an exception
+TEST(PubSubTest, MoveOnlyTypeMultipleSubscribersThrows) {
+    PubSub ps;
+    auto sub1 = ps.Subscribe<std::unique_ptr<int>>("move_only_multi");
+    auto sub2 = ps.Subscribe<std::unique_ptr<int>>("move_only_multi");
+
+    auto ptr = std::make_unique<int>(42);
+    EXPECT_THROW({
+        ps.Publish("move_only_multi", std::move(ptr));
+    }, std::runtime_error);
+}
+
+// Custom move-only type that implements a clone() method
+struct CustomMoveOnly {
+    int val;
+    explicit CustomMoveOnly(int v) : val(v) {}
+    CustomMoveOnly(const CustomMoveOnly&) = delete;
+    CustomMoveOnly& operator=(const CustomMoveOnly&) = delete;
+    CustomMoveOnly(CustomMoveOnly&&) = default;
+    CustomMoveOnly& operator=(CustomMoveOnly&&) = default;
+
+    CustomMoveOnly clone() const {
+        return CustomMoveOnly(val);
+    }
+};
+
+// Test that move-only types with a clone() method can be published to multiple subscribers successfully
+TEST(PubSubTest, MoveOnlyCloneableType) {
+    PubSub ps;
+    auto sub1 = ps.Subscribe<CustomMoveOnly>("cloneable_multi");
+    auto sub2 = ps.Subscribe<CustomMoveOnly>("cloneable_multi");
+
+    CustomMoveOnly msg(99);
+    ps.Publish("cloneable_multi", std::move(msg));
+
+    auto r1 = sub1->try_receive();
+    auto r2 = sub2->try_receive();
+
+    ASSERT_TRUE(r1.has_value());
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(r1->val, 99);
+    EXPECT_EQ(r2->val, 99);
+}
+
+// Another move-only type without clone() that uses template specialization of Cloner
+struct SpecializedMoveOnly {
+    int val;
+    explicit SpecializedMoveOnly(int v) : val(v) {}
+    SpecializedMoveOnly(const SpecializedMoveOnly&) = delete;
+    SpecializedMoveOnly& operator=(const SpecializedMoveOnly&) = delete;
+    SpecializedMoveOnly(SpecializedMoveOnly&&) = default;
+    SpecializedMoveOnly& operator=(SpecializedMoveOnly&&) = default;
+};
+
+namespace cpppubsub {
+    template <>
+    struct Cloner<SpecializedMoveOnly> {
+        static SpecializedMoveOnly perform(const SpecializedMoveOnly& val) {
+            return SpecializedMoveOnly{val.val};
+        }
+    };
+}
+
+// Test that move-only types with specialized Cloner can be published to multiple subscribers successfully
+TEST(PubSubTest, MoveOnlySpecializedClonerType) {
+    PubSub ps;
+    auto sub1 = ps.Subscribe<SpecializedMoveOnly>("specialized_multi");
+    auto sub2 = ps.Subscribe<SpecializedMoveOnly>("specialized_multi");
+
+    SpecializedMoveOnly msg(55);
+    ps.Publish("specialized_multi", std::move(msg));
+
+    auto r1 = sub1->try_receive();
+    auto r2 = sub2->try_receive();
+
+    ASSERT_TRUE(r1.has_value());
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(r1->val, 55);
+    EXPECT_EQ(r2->val, 55);
+}
+
+// Test that Selector supports move-only type callbacks and successfully transfers ownership
+TEST(SelectorTest, MoveOnlyTypeCallback) {
+    PubSub ps;
+    auto sub = ps.Subscribe<std::unique_ptr<int>>("move_only_sel");
+
+    Selector selector;
+    std::unique_ptr<int> received_ptr;
+    
+    // Callback takes std::unique_ptr<int> by value to take ownership!
+    selector.Add<std::unique_ptr<int>>(sub, [&received_ptr](std::unique_ptr<int> ptr) {
+        received_ptr = std::move(ptr);
+    });
+
+    auto ptr = std::make_unique<int>(999);
+    ps.Publish("move_only_sel", std::move(ptr));
+
+    bool processed = selector.WaitFor(std::chrono::milliseconds(100));
+    EXPECT_TRUE(processed);
+    ASSERT_NE(received_ptr, nullptr);
+    EXPECT_EQ(*received_ptr, 999);
+}
+
+// Test that Selector correctly handles extremely large timeout values without overflow/indefinite wait
+TEST(SelectorTest, LargeTimeoutClamping) {
+    PubSub ps;
+    auto sub = ps.Subscribe<int>("large_timeout_topic");
+
+    Selector selector;
+    std::atomic<int> received_val{0};
+    selector.Add<int>(sub, [&received_val](const int& val) {
+        received_val = val;
+    });
+
+    // Start a thread to publish a message after 20ms
+    std::thread t([&ps]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        ps.Publish<int>("large_timeout_topic", 123);
+    });
+
+    // Call WaitFor with an extremely large timeout (1 year)
+    // If integer overflow occurs, this might wait indefinitely or crash.
+    // Clamping to a max safe value ensures it successfully waits and wakes up when the thread publishes.
+    bool processed = selector.WaitFor(std::chrono::hours(24 * 365));
+    t.join();
+
+    EXPECT_TRUE(processed);
+    EXPECT_EQ(received_val.load(), 123);
+}
+
+
+
 

@@ -52,11 +52,37 @@ You can customize the maximum capacity and the overflow behavior when subscribin
 auto sub = broker.Subscribe<std::string>("fast_topic", 5000, cpppubsub::OverflowPolicy::DropOldest);
 ```
 
+> [!IMPORTANT]
+> The subscriber capacity **must be greater than 0**. If you pass `0` as the capacity, `Subscribe` will throw a `std::invalid_argument` exception.
+
 ### Available Policies
 
 - **`cpppubsub::OverflowPolicy::Block` (Default):** Pauses the publisher thread until space becomes available. Use this when you cannot afford to drop messages.
 - **`cpppubsub::OverflowPolicy::DropOldest`:** Discards the oldest unread message in the subscriber's queue to make room for the new one. Use this for high-frequency topics where only the latest data matters (e.g., sensor telemetry).
 - **`cpppubsub::OverflowPolicy::DropNewest`:** Discards the incoming published message if the queue is full. Use this when you want to protect the publisher but keep the oldest pending data.
+
+## Explicit Unsubscribe & Topic Lifecycle
+
+While `cpp-pubsub` features robust automatic subscriber cleanup during subsequent publish cycles via `std::weak_ptr`, you can also manage subscriber and topic lifecycles explicitly.
+
+### Explicit Unsubscribe
+To immediately disconnect a subscriber and stop it from receiving new messages without waiting for it to go out of scope, use the `Unsubscribe` method:
+
+```cpp
+// Unsubscribe the subscriber from the topic
+broker.Unsubscribe<std::string>("system_events", sub);
+```
+
+### Explicit Topic Removal
+You can explicitly remove a topic from the broker, which deletes the topic mapping and frees resources. Any existing publishers or subscribers for that topic will be disconnected from future publications on that topic name:
+
+```cpp
+// Remove a specific topic
+broker.RemoveTopic("system_events");
+
+// Clear all topics from the broker
+broker.ClearTopics();
+```
 
 ---
 [< Previous: Getting Started](./getting-started.html) | [🏠 Home](./) | [Next: Advanced Usage >](./advanced-usage.html)

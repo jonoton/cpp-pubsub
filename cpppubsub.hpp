@@ -15,7 +15,9 @@
 #include <optional>
 #include <typeindex>
 #include <stdexcept>
-#include <iostream>
+#include <algorithm>
+#include <type_traits>
+#include <limits>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -30,7 +32,7 @@ namespace cpppubsub
 {
 
     constexpr int VERSION_MAJOR = 1;
-    constexpr int VERSION_MINOR = 3;
+    constexpr int VERSION_MINOR = 4;
     constexpr int VERSION_PATCH = 0;
 
     /**
@@ -98,6 +100,9 @@ namespace cpppubsub
         Subscriber(size_t max_capacity = 1000, OverflowPolicy policy = OverflowPolicy::Block)
             : max_capacity_(max_capacity), overflow_policy_(policy)
         {
+            if (max_capacity == 0)
+                throw std::invalid_argument("max_capacity must be greater than 0");
+
 #ifdef _WIN32
             // Manual-reset event
             event_ = CreateEvent(NULL, TRUE, FALSE, NULL);
@@ -107,8 +112,18 @@ namespace cpppubsub
             if (pipe(pipe_fds_) != 0)
                 throw std::runtime_error("Failed to create POSIX pipe");
             // Set both ends to non-blocking
-            fcntl(pipe_fds_[0], F_SETFL, O_NONBLOCK);
-            fcntl(pipe_fds_[1], F_SETFL, O_NONBLOCK);
+            if (fcntl(pipe_fds_[0], F_SETFL, O_NONBLOCK) == -1)
+            {
+                ::close(pipe_fds_[0]);
+                ::close(pipe_fds_[1]);
+                throw std::runtime_error("Failed to set pipe read end to non-blocking");
+            }
+            if (fcntl(pipe_fds_[1], F_SETFL, O_NONBLOCK) == -1)
+            {
+                ::close(pipe_fds_[0]);
+                ::close(pipe_fds_[1]);
+                throw std::runtime_error("Failed to set pipe write end to non-blocking");
+            }
 #endif
         }
 
@@ -123,6 +138,12 @@ namespace cpppubsub
             ::close(pipe_fds_[1]);
 #endif
         }
+
+        // Subscriber is non-copyable and non-movable to ensure resource-safety
+        Subscriber(const Subscriber &) = delete;
+        Subscriber &operator=(const Subscriber &) = delete;
+        Subscriber(Subscriber &&) = delete;
+        Subscriber &operator=(Subscriber &&) = delete;
 
 #ifdef _WIN32
         /**
@@ -144,36 +165,80 @@ namespace cpppubsub
          */
         void push(const T &message)
         {
-            bool needs_signal = false;
+            static_assert(std::is_copy_constructible_v<T>,
+                          "push(const T&) requires copy-constructible type T. Use push(T&&) for move-only types.");
+
+            std::unique_lock<std::mutex> lock(mtx_);
+
+            if (closed_)
+                return;
+
+            if (queue_.size() >= max_capacity_)
             {
-                std::unique_lock<std::mutex> lock(mtx_);
-
-                if (closed_)
-                    return;
-
-                if (queue_.size() >= max_capacity_)
+                if (overflow_policy_ == OverflowPolicy::Block)
                 {
-                    if (overflow_policy_ == OverflowPolicy::Block)
-                    {
-                        cv_space_.wait(lock, [this]()
-                                       { return queue_.size() < max_capacity_ || closed_; });
-                        if (closed_)
-                            return;
-                    }
-                    else if (overflow_policy_ == OverflowPolicy::DropOldest)
-                    {
-                        queue_.pop_front();
-                    }
-                    else if (overflow_policy_ == OverflowPolicy::DropNewest)
-                    {
+                    cv_space_.wait(lock, [this]()
+                                   { return queue_.size() < max_capacity_ || closed_; });
+                    if (closed_)
                         return;
-                    }
                 }
-                needs_signal = queue_.empty();
-                queue_.push_back(message);
+                else if (overflow_policy_ == OverflowPolicy::DropOldest)
+                {
+                    queue_.pop_front();
+                }
+                else if (overflow_policy_ == OverflowPolicy::DropNewest)
+                {
+                    return;
+                }
             }
+            bool needs_signal = queue_.empty();
+            queue_.push_back(message);
 
-            // Signal OS event (outside of mutex lock)
+            // Signal OS event (inside mutex lock to prevent lost wakeups)
+            if (needs_signal)
+            {
+#ifdef _WIN32
+                SetEvent(event_);
+#else
+                char c = 1;
+                [[maybe_unused]] auto res = write(pipe_fds_[1], &c, 1);
+#endif
+            }
+        }
+
+        /**
+         * @brief Pushes a message into the subscriber's queue by moving.
+         * @param message The message to push.
+         */
+        void push(T &&message)
+        {
+            std::unique_lock<std::mutex> lock(mtx_);
+
+            if (closed_)
+                return;
+
+            if (queue_.size() >= max_capacity_)
+            {
+                if (overflow_policy_ == OverflowPolicy::Block)
+                {
+                    cv_space_.wait(lock, [this]()
+                                   { return queue_.size() < max_capacity_ || closed_; });
+                    if (closed_)
+                        return;
+                }
+                else if (overflow_policy_ == OverflowPolicy::DropOldest)
+                {
+                    queue_.pop_front();
+                }
+                else if (overflow_policy_ == OverflowPolicy::DropNewest)
+                {
+                    return;
+                }
+            }
+            bool needs_signal = queue_.empty();
+            queue_.push_back(std::move(message));
+
+            // Signal OS event (inside mutex lock to prevent lost wakeups)
             if (needs_signal)
             {
 #ifdef _WIN32
@@ -192,7 +257,7 @@ namespace cpppubsub
         std::optional<T> try_receive()
         {
             bool popped = false;
-            T msg;
+            std::optional<T> msg;
 
             {
                 std::lock_guard<std::mutex> lock(mtx_);
@@ -201,7 +266,7 @@ namespace cpppubsub
 #ifdef _WIN32
                     ResetEvent(event_);
 #else
-                    // Clear the pipe so poll stops triggering
+                    // Clear the pipe so poll stops triggering (inside lock to prevent races)
                     char c;
                     while (read(pipe_fds_[0], &c, 1) > 0)
                     {
@@ -219,7 +284,7 @@ namespace cpppubsub
 #ifdef _WIN32
                     ResetEvent(event_);
 #else
-                    // Clear the pipe
+                    // Clear the pipe (inside lock to prevent races)
                     char c;
                     while (read(pipe_fds_[0], &c, 1) > 0)
                     {
@@ -241,12 +306,10 @@ namespace cpppubsub
          */
         void close()
         {
-            {
-                std::lock_guard<std::mutex> lock(mtx_);
-                if (closed_)
-                    return;
-                closed_ = true;
-            }
+            std::lock_guard<std::mutex> lock(mtx_);
+            if (closed_)
+                return;
+            closed_ = true;
 #ifdef _WIN32
             SetEvent(event_);
 #else
@@ -256,6 +319,49 @@ namespace cpppubsub
             cv_space_.notify_all();
         }
     };
+
+    // Type trait to detect if T has a .clone() const member function
+    template <typename T, typename = void>
+    struct has_clone : std::false_type
+    {
+    };
+
+    template <typename T>
+    struct has_clone<T, std::void_t<decltype(std::declval<const T &>().clone())>> : std::true_type
+    {
+    };
+
+    // Extensible Cloner template that can be specialized by users for custom types
+    template <typename T, typename = void>
+    struct Cloner
+    {
+        template <typename U = T>
+        static auto perform(const U &val) -> typename std::enable_if_t<std::is_copy_constructible_v<U> || has_clone<U>::value, U>
+        {
+            if constexpr (std::is_copy_constructible_v<U>)
+            {
+                return val;
+            }
+            else
+            {
+                return val.clone();
+            }
+        }
+    };
+
+    // Trait to check if a type is cloneable/copyable via Cloner
+    template <typename T, typename = void>
+    struct is_cloneable : std::false_type
+    {
+    };
+
+    template <typename T>
+    struct is_cloneable<T, std::void_t<decltype(Cloner<T>::perform(std::declval<const T &>()))>> : std::true_type
+    {
+    };
+
+    template <typename T>
+    constexpr bool is_cloneable_v = is_cloneable<T>::value;
 
     /**
      * @brief Base class for type-erased topics.
@@ -289,10 +395,59 @@ namespace cpppubsub
         }
 
         /**
+         * @brief Explicitly removes a subscriber from this topic.
+         * @param sub A shared pointer to the subscriber to remove.
+         */
+        void RemoveSubscriber(const std::shared_ptr<Subscriber<T>> &sub)
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            subscribers_.erase(
+                std::remove_if(subscribers_.begin(), subscribers_.end(),
+                               [&sub](const std::weak_ptr<Subscriber<T>> &weak_sub)
+                               {
+                                   auto shared = weak_sub.lock();
+                                   return !shared || shared == sub;
+                               }),
+                subscribers_.end());
+        }
+
+        /**
          * @brief Publishes a message to all active subscribers.
          * @param message The message to publish.
          */
         void Publish(const T &message)
+        {
+            if constexpr (is_cloneable_v<T>)
+            {
+                std::vector<std::shared_ptr<Subscriber<T>>> active_subs;
+                {
+                    std::lock_guard<std::mutex> lock(mtx_);
+                    for (auto it = subscribers_.begin(); it != subscribers_.end();)
+                    {
+                        if (auto sub = it->lock())
+                        {
+                            active_subs.push_back(sub);
+                            ++it;
+                        }
+                        else
+                        {
+                            it = subscribers_.erase(it); // Auto-cleanup dead subscribers
+                        }
+                    }
+                }
+
+                for (auto &sub : active_subs)
+                {
+                    sub->push(Cloner<T>::perform(message));
+                }
+            }
+        }
+
+        /**
+         * @brief Publishes a message to all active subscribers by moving.
+         * @param message The message to publish.
+         */
+        void Publish(T &&message)
         {
             std::vector<std::shared_ptr<Subscriber<T>>> active_subs;
             {
@@ -311,9 +466,28 @@ namespace cpppubsub
                 }
             }
 
-            for (auto &sub : active_subs)
+            if (active_subs.empty())
+                return;
+
+            if (active_subs.size() == 1)
             {
-                sub->push(message);
+                // Zero-overhead direct move for a single subscriber (works for copyable and move-only types)
+                active_subs[0]->push(std::move(message));
+                return;
+            }
+
+            // Multiple subscribers case
+            if constexpr (is_cloneable_v<T>)
+            {
+                for (size_t i = 0; i + 1 < active_subs.size(); ++i)
+                {
+                    active_subs[i]->push(Cloner<T>::perform(message));
+                }
+                active_subs.back()->push(std::move(message));
+            }
+            else
+            {
+                throw std::runtime_error("Cannot publish move-only type to multiple subscribers without a Cloner/clone mechanism");
             }
         }
     };
@@ -338,6 +512,15 @@ namespace cpppubsub
         void Publish(const T &message)
         {
             topic_->Publish(message);
+        }
+
+        /**
+         * @brief Publishes a message directly to the topic by moving.
+         * @param message The message to publish.
+         */
+        void Publish(T &&message)
+        {
+            topic_->Publish(std::move(message));
         }
     };
 
@@ -387,6 +570,46 @@ namespace cpppubsub
         }
 
         /**
+         * @brief Unsubscribes a subscriber from a topic.
+         * @tparam T The message type.
+         * @param name The name of the topic.
+         * @param sub The subscriber to unsubscribe.
+         */
+        template <typename T>
+        void Unsubscribe(const std::string &name, const std::shared_ptr<Subscriber<T>> &sub)
+        {
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            auto it = topics_.find(name);
+            if (it != topics_.end())
+            {
+                auto topic = std::dynamic_pointer_cast<Topic<T>>(it->second);
+                if (topic)
+                {
+                    topic->RemoveSubscriber(sub);
+                }
+            }
+        }
+
+        /**
+         * @brief Explicitly removes a topic from the manager.
+         * @param name The name of the topic to remove.
+         */
+        void RemoveTopic(const std::string &name)
+        {
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            topics_.erase(name);
+        }
+
+        /**
+         * @brief Clears all topics from the manager.
+         */
+        void ClearTopics()
+        {
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            topics_.clear();
+        }
+
+        /**
          * @brief Creates a high-performance publisher for a topic.
          * @tparam T The message type.
          * @param name The name of the topic.
@@ -411,6 +634,19 @@ namespace cpppubsub
             auto topic = GetOrCreateTopic<T>(name);
             topic->Publish(message);
         }
+
+        /**
+         * @brief Publishes a message to a topic by moving.
+         * @tparam T The message type.
+         * @param name The name of the topic.
+         * @param message The message to publish.
+         */
+        template <typename T>
+        void Publish(const std::string &name, T &&message)
+        {
+            auto topic = GetOrCreateTopic<typename std::decay<T>::type>(name);
+            topic->Publish(std::move(message));
+        }
     };
 
     /**
@@ -432,7 +668,8 @@ namespace cpppubsub
             int fd;
 #endif
             std::function<bool()> process_all;
-            bool dead = false;
+            std::function<bool()> is_expired;
+            std::atomic<bool> dead{false};
         };
 
         std::mutex mtx_;
@@ -450,9 +687,13 @@ namespace cpppubsub
          * @tparam T The message type.
          * @param sub The subscriber to monitor.
          * @param callback The function to call when a message is received.
+         *
+         * @warning The callback is captured by value. Ensure that any objects
+         * referenced by the callback outlive the Selector or the Subscriber to
+         * avoid dangling references.
          */
-        template <typename T>
-        void Add(std::shared_ptr<Subscriber<T>> sub, std::function<void(const T &)> callback)
+        template <typename T, typename F>
+        void Add(std::shared_ptr<Subscriber<T>> sub, F &&callback)
         {
             auto target = std::make_shared<WaitTarget>();
 #ifdef _WIN32
@@ -461,7 +702,11 @@ namespace cpppubsub
             target->fd = sub->GetWaitFD();
 #endif
             std::weak_ptr<Subscriber<T>> weak_sub = sub;
-            target->process_all = [weak_sub, callback]() -> bool
+            target->is_expired = [weak_sub]() -> bool
+            {
+                return weak_sub.expired();
+            };
+            target->process_all = [weak_sub, callback = std::forward<F>(callback)]() -> bool
             {
                 auto locked_sub = weak_sub.lock();
                 if (!locked_sub)
@@ -473,7 +718,7 @@ namespace cpppubsub
                     auto msg = locked_sub->try_receive();
                     if (!msg)
                         break;
-                    callback(*msg);
+                    callback(std::move(*msg));
                 }
                 return true; // Still alive
             };
@@ -493,6 +738,24 @@ namespace cpppubsub
         template <typename Rep, typename Period>
         bool WaitFor(const std::chrono::duration<Rep, Period> &timeout)
         {
+            int timeout_ms = 0;
+            if (timeout >= std::chrono::milliseconds(std::numeric_limits<int>::max()))
+            {
+                timeout_ms = std::numeric_limits<int>::max();
+            }
+            else if (timeout < std::chrono::duration<Rep, Period>::zero())
+            {
+                timeout_ms = -1; // Indefinite wait
+            }
+            else
+            {
+                timeout_ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count());
+                if (timeout_ms == 0 && timeout > std::chrono::duration<Rep, Period>::zero())
+                {
+                    timeout_ms = 1; // Round up sub-millisecond positive values to prevent zero-timeout busy loops
+                }
+            }
+
             std::vector<std::shared_ptr<WaitTarget>> local_targets;
 #ifdef _WIN32
             std::vector<HANDLE> handles;
@@ -502,6 +765,21 @@ namespace cpppubsub
 
             {
                 std::unique_lock<std::mutex> lock(mtx_);
+
+                // Pre-pass: check for expired subscribers to prevent dead locks / busy loops on invalid fds/handles
+                bool expired_found = false;
+                for (auto &t : targets_)
+                {
+                    if (t->is_expired && t->is_expired())
+                    {
+                        t->dead = true;
+                        expired_found = true;
+                    }
+                }
+                if (expired_found)
+                {
+                    dirty_ = true;
+                }
 
                 if (dirty_)
                 {
@@ -527,7 +805,18 @@ namespace cpppubsub
                 }
 
                 if (targets_.empty())
+                {
+                    lock.unlock();
+                    if (timeout_ms > 0)
+                    {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
+                    }
+                    else if (timeout_ms < 0)
+                    {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
                     return false;
+                }
 
                 local_targets = targets_;
 #ifdef _WIN32
@@ -537,8 +826,6 @@ namespace cpppubsub
 #endif
             }
 
-            auto timeout_ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count();
-
 #ifdef _WIN32
             if (handles.size() <= MAXIMUM_WAIT_OBJECTS)
             {
@@ -547,14 +834,21 @@ namespace cpppubsub
 
                 if (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + handles.size())
                 {
-                    size_t idx = result - WAIT_OBJECT_0;
-                    if (!local_targets[idx]->process_all())
+                    bool any_processed = false;
+                    for (size_t i = 0; i < handles.size(); ++i)
                     {
-                        local_targets[idx]->dead = true;
-                        std::lock_guard<std::mutex> lock(mtx_);
-                        dirty_ = true;
+                        if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0)
+                        {
+                            if (!local_targets[i]->process_all())
+                            {
+                                local_targets[i]->dead = true;
+                                std::lock_guard<std::mutex> lock(mtx_);
+                                dirty_ = true;
+                            }
+                            any_processed = true;
+                        }
                     }
-                    return true;
+                    return any_processed;
                 }
                 return false;
             }
@@ -566,11 +860,25 @@ namespace cpppubsub
                 // performance on Windows, distribute subscriptions across multiple Worker instances
                 // to keep each under the 64-handle limit.
                 HANDLE wakeup_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+                if (!wakeup_event)
+                    throw std::runtime_error("Failed to create Windows Event for fallback threadpool registration");
+
                 std::vector<HANDLE> wait_handles(handles.size(), NULL);
 
                 for (size_t i = 0; i < handles.size(); ++i)
                 {
-                    RegisterWaitForSingleObject(&wait_handles[i], handles[i], &detail::SelectorWaitCallback, wakeup_event, INFINITE, WT_EXECUTEONLYONCE);
+                    if (!RegisterWaitForSingleObject(&wait_handles[i], handles[i], &detail::SelectorWaitCallback, wakeup_event, INFINITE, WT_EXECUTEONLYONCE))
+                    {
+                        for (size_t j = 0; j < i; ++j)
+                        {
+                            if (wait_handles[j])
+                            {
+                                UnregisterWaitEx(wait_handles[j], INVALID_HANDLE_VALUE);
+                            }
+                        }
+                        CloseHandle(wakeup_event);
+                        throw std::runtime_error("RegisterWaitForSingleObject failed");
+                    }
                 }
 
                 WaitForSingleObject(wakeup_event, static_cast<DWORD>(timeout_ms));
@@ -607,7 +915,7 @@ namespace cpppubsub
                 bool processed = false;
                 for (size_t i = 0; i < fds.size(); ++i)
                 {
-                    if (fds[i].revents & POLLIN)
+                    if (fds[i].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL))
                     {
                         if (!local_targets[i]->process_all())
                         {
@@ -638,6 +946,8 @@ namespace cpppubsub
         std::atomic<bool> running_{false};
         std::thread thread_;
         Selector selector_;
+
+        std::mutex worker_mutex_;
         std::function<void()> tick_callback_;
         std::chrono::milliseconds timeout_{50};
 
@@ -645,9 +955,18 @@ namespace cpppubsub
         {
             while (running_.load(std::memory_order_relaxed))
             {
-                selector_.WaitFor(timeout_);
-                if (tick_callback_)
-                    tick_callback_();
+                std::chrono::milliseconds timeout;
+                std::function<void()> callback;
+                {
+                    std::lock_guard<std::mutex> lock(worker_mutex_);
+                    timeout = timeout_;
+                    callback = tick_callback_;
+                }
+
+                selector_.WaitFor(timeout);
+
+                if (callback)
+                    callback();
             }
         }
 
@@ -664,10 +983,10 @@ namespace cpppubsub
          * @param sub The subscriber to monitor.
          * @param callback The function to call when a message is received.
          */
-        template <typename T>
-        inline void AddSubscription(std::shared_ptr<Subscriber<T>> sub, std::function<void(const T &)> callback)
+        template <typename T, typename F>
+        void AddSubscription(std::shared_ptr<Subscriber<T>> sub, F &&callback)
         {
-            selector_.Add(sub, std::move(callback));
+            selector_.Add(sub, std::forward<F>(callback));
         }
 
         /**
@@ -675,8 +994,9 @@ namespace cpppubsub
          * @param timeout The maximum duration to wait between ticks.
          * @param callback The function to call on tick.
          */
-        inline void SetTickCallback(std::chrono::milliseconds timeout, std::function<void()> callback)
+        void SetTickCallback(std::chrono::milliseconds timeout, std::function<void()> callback)
         {
+            std::lock_guard<std::mutex> lock(worker_mutex_);
             timeout_ = timeout;
             tick_callback_ = std::move(callback);
         }
@@ -684,7 +1004,7 @@ namespace cpppubsub
         /**
          * @brief Starts the background worker thread.
          */
-        inline void Start()
+        void Start()
         {
             bool expected = false;
             if (running_.compare_exchange_strong(expected, true))
@@ -696,12 +1016,21 @@ namespace cpppubsub
         /**
          * @brief Stops the background worker thread and blocks until it finishes.
          */
-        inline void Stop()
+        void Stop()
         {
             if (running_.exchange(false))
             {
                 if (thread_.joinable())
-                    thread_.join();
+                {
+                    if (std::this_thread::get_id() == thread_.get_id())
+                    {
+                        thread_.detach();
+                    }
+                    else
+                    {
+                        thread_.join();
+                    }
+                }
             }
         }
     };

@@ -3,9 +3,17 @@
 #include <string>
 #include <thread>
 #include <chrono>
+#include <mutex>
+
+// Thread-safe printing utility to avoid concurrent cout interleave issues
+std::mutex cout_mtx;
+void print_safe(const std::string& msg) {
+    std::lock_guard<std::mutex> lock(cout_mtx);
+    std::cout << msg << "\n";
+}
 
 int main() {
-    std::cout << "Starting Worker PubSub Example...\n";
+    print_safe("Starting Worker PubSub Example...");
 
     cpppubsub::PubSub pubsub;
     cpppubsub::Worker worker;
@@ -15,11 +23,11 @@ int main() {
     auto sub_nums = pubsub.Subscribe<int>("num_events");
 
     worker.AddSubscription<std::string>(sub_text, [](const std::string& msg) {
-        std::cout << "[Worker] Processed Text Event: " << msg << "\n";
+        print_safe("[Worker] Processed Text Event: " + msg);
     });
 
     worker.AddSubscription<int>(sub_nums, [](const int& msg) {
-        std::cout << "[Worker] Processed Num Event: " << msg << "\n";
+        print_safe("[Worker] Processed Num Event: " + std::to_string(msg));
     });
 
     // Start the background worker
@@ -36,6 +44,6 @@ int main() {
 
     worker.Stop();
     
-    std::cout << "Finished Worker PubSub Example.\n";
+    print_safe("Finished Worker PubSub Example.");
     return 0;
 }
