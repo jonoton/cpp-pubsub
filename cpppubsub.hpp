@@ -20,6 +20,9 @@
 #include <limits>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
@@ -32,7 +35,7 @@ namespace cpppubsub
 {
 
     constexpr int VERSION_MAJOR = 1;
-    constexpr int VERSION_MINOR = 4;
+    constexpr int VERSION_MINOR = 5;
     constexpr int VERSION_PATCH = 0;
 
     /**
@@ -739,9 +742,9 @@ namespace cpppubsub
         bool WaitFor(const std::chrono::duration<Rep, Period> &timeout)
         {
             int timeout_ms = 0;
-            if (timeout >= std::chrono::milliseconds(std::numeric_limits<int>::max()))
+            if (timeout >= std::chrono::milliseconds((std::numeric_limits<int>::max)()))
             {
-                timeout_ms = std::numeric_limits<int>::max();
+                timeout_ms = (std::numeric_limits<int>::max)();
             }
             else if (timeout < std::chrono::duration<Rep, Period>::zero())
             {

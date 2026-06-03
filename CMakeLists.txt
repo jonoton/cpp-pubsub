@@ -11,6 +11,10 @@ add_library(cpppubsub::cpppubsub ALIAS cpppubsub)
 target_include_directories(cpppubsub INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(cpppubsub INTERFACE cxx_std_17)
 
+if(WIN32)
+    target_compile_definitions(cpppubsub INTERFACE NOMINMAX)
+endif()
+
 find_package(Threads REQUIRED)
 target_link_libraries(cpppubsub INTERFACE Threads::Threads)
 
