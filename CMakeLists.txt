@@ -25,6 +25,10 @@ else()
     set(IS_TOP_LEVEL OFF)
 endif()
 
+if(IS_TOP_LEVEL)
+    set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+endif()
+
 # Option to build examples
 option(CPPPUBSUB_BUILD_EXAMPLES "Build the example programs" ${IS_TOP_LEVEL})
 

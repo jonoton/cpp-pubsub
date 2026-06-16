@@ -32,6 +32,8 @@ Thumbs.db
 *_demo
 *_sim
 *_logger
+compile_commands.json
+.cache/
 
 # Jekyll
 docs/_site/
